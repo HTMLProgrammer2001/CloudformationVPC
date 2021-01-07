@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Config file for basic VPC'
+
+
+Parameters:
+    InstanceType:
+        Type: String
+        Description: 'Type of instance to start'
+        Default: 't2.micro'
+
+    CPUValue:
+        Type: Number
+        Default: '80'
+        Description: 'CPU usage for scale out'
+
+    AMI:
+        Type: String
+        Default: 'ami-03c3a7e4263fd998c'
+        Description: 'AMI ID'
+
+Resources:
+    #create VPC
+    VPC:
+        Type: 'AWS::EC2::VPC'
+        Properties:
+            EnableDnsHostnames: true
+            EnableDnsSupport: true
+            CidrBlock: '10.0.0.0/16'
+            Tags:
+                - Key: 'Name'
+                  Value: !Sub ${AWS::StackName}-VPC
+
+    #create subnets
+    PublicSubnetA:
+        Type: 'AWS::EC2::Subnet'
+        Properties:
+            AvailabilityZone: !Select
+                - 0
+                - !GetAZs
+                  Ref: 'AWS::Region'
+
+            CidrBlock: '10.0.1.0/24'
+            VpcId: !Ref VPC
+            Tags:
+                - Key: 'Name'
+                  Value: !Sub ${AWS::StackName}-PublicSubnetA
+
+    PublicSubnetB:
+        Type: 'AWS::EC2::Subnet'
+        Properties:
+            AvailabilityZone: !Select
+                - 1
+                - !GetAZs
+                  Ref: 'AWS::Region'
+
+            CidrBlock: '10.0.2.0/24'
+            VpcId: !Ref VPC
+            Tags:
+                -   Key: 'Name'
+                    Value: !Sub ${AWS::StackName}-PublicSubnetB
+
+    # create gateways
+    InternetGateway:
+        Type: 'AWS::EC2::InternetGateway'
+        Properties:
+            Tags:
+                - Key: 'Name'
+                  Value: !Sub ${AWS::StackName}-Internet
+
+    InternetAttach:
+        Type: 'AWS::EC2::VPCGatewayAttachment'
+        Properties:
+            VpcId: !Ref VPC
+            InternetGatewayId: !Ref InternetGateway
+
+    # create route tables
+    PublicRouteTable:
+        Type: 'AWS::EC2::RouteTable'
+        Properties:
+            VpcId: !Ref VPC
+            Tags:
+                - Key: 'Name'
+                  Value: !Sub ${AWS::StackName}-PublicRT
+
+    InternetRoute:
+        Type: 'AWS::EC2::Route'
+        Properties:
+            RouteTableId: !Ref PublicRouteTable
+            GatewayId: !Ref InternetGateway
+            DestinationCidrBlock: '0.0.0.0/0'
+
+    # associations
+    AssociateToPubA:
+        Type: 'AWS::EC2::SubnetRouteTableAssociation'
+        Properties:
+            RouteTableId: !Ref PublicRouteTable
+            SubnetId: !Ref PublicSubnetA
+
+    AssociateToPubB:
+        Type: 'AWS::EC2::SubnetRouteTableAssociation'
+        Properties:
+            RouteTableId: !Ref PublicRouteTable
+            SubnetId: !Ref PublicSubnetB
+
+    # create security groups
+    PubSecurityGroup:
+       Type: 'AWS::EC2::SecurityGroup'
+       Properties:
+           GroupDescription: 'Security group for public instances'
+           VpcId: !Ref VPC
+           SecurityGroupIngress:
+               - IpProtocol: tcp
+                 FromPort: 80
+                 ToPort: 80
+                 CidrIp: 0.0.0.0/0
+
+    # create ELB
+    ELB:
+      Type: 'AWS::ElasticLoadBalancing::LoadBalancer'
+      Properties:
+        Listeners:
+          - InstancePort: '80'
+            InstanceProtocol: HTTP
+            LoadBalancerPort: '80'
+            Protocol: HTTP
+
+        HealthCheck:
+          HealthyThreshold: '3'
+          Interval: '5'
+          Timeout: '3'
+          UnhealthyThreshold: '3'
+          Target: HTTP:80/
+
+        Subnets: 
+          - !Ref PublicSubnetA
+          - !Ref PublicSubnetB
+
+    # create launch conf for AutoScaling
+    LaunchConf:
+        Type: 'AWS::AutoScaling::LaunchConfiguration'
+        Properties:
+            AssociatePublicIpAddress: true
+            ImageId: !Ref AMI
+            InstanceType: !Ref InstanceType
+            SecurityGroups:
+                - !Ref PubSecurityGroup
+
+            BlockDeviceMappings:
+                -   DeviceName: /dev/sdc
+                    Ebs:
+                        VolumeSize: 10
+                        VolumeType: "gp2"
+
+            UserData: !Base64 |
+              #!/bin/bash
+              sudo su
+              yum update -y
+              yum install httpd -y
+              systemctl enable httpd
+              echo "<b>Hi</b>" > /var/www/html/index.html
+
+    # create autoscaling
+    PubAutoScaling:
+        Type: 'AWS::AutoScaling::AutoScalingGroup'
+        Properties:
+            MaxSize: '4'
+            MinSize: '2'
+            DesiredCapacity: '2'
+            HealthCheckGracePeriod: 300
+            AutoScalingGroupName: Test
+            LoadBalancerNames:
+              - !Ref ELB
+
+            LaunchConfigurationName: !Ref LaunchConf
+
+            VPCZoneIdentifier:
+                - !Ref PublicSubnetA
+                - !Ref PublicSubnetB
+
+    ASGPolicy:
+        Type: 'AWS::AutoScaling::ScalingPolicy'
+        Properties:
+            AutoScalingGroupName: !Ref PubAutoScaling
+            PolicyType: TargetTrackingScaling
+            TargetTrackingConfiguration:
+                PredefinedMetricSpecification:
+                    PredefinedMetricType: ASGAverageCPUUtilization
+                TargetValue: !Ref CPUValue
+
+Outputs:
+  URL:
+    Value: !Join
+      - ''
+      -   - "http://"
+          - !GetAtt ELB.DNSName
+          - "/"
